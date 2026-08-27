@@ -1,9 +1,11 @@
 import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:open_file/open_file.dart';
+
 import '../utils/app_utils.dart';
 
 /// Represents an external video player that can be launched from Skystream.
@@ -260,13 +262,15 @@ class ExternalPlayerService {
       // Use the native Kotlin channel which constructs a proper Android Intent.
       // This avoids url_launcher's Uri.parse() which breaks on video URLs
       // containing query parameters (?key=value&...).
-      final result = await _playerChannel
-          .invokeMethod<bool>('launchVideoInPlayer', {
-            'url': videoUrl,
-            'package': player.androidPackage,
-            'mimeType': 'video/*',
-            'title': ?title,
-          });
+      final result = await _playerChannel.invokeMethod<bool>(
+        'launchVideoInPlayer',
+        {
+          'url': videoUrl,
+          'package': player.androidPackage,
+          'mimeType': 'video/*',
+          'title': ?title,
+        },
+      );
       return result ?? false;
     } on PlatformException catch (e) {
       if (kDebugMode) debugPrint('Android external player error: ${e.message}');
@@ -385,10 +389,7 @@ class ExternalPlayerService {
     final primaryCommand = player.desktopCommand;
     if (primaryCommand == null) return false;
 
-    final commands = <String>{
-      primaryCommand,
-      ...player.desktopCommandAliases,
-    };
+    final commands = <String>{primaryCommand, ...player.desktopCommandAliases};
     final arguments = buildDesktopLaunchArguments(player, videoUrl);
 
     try {

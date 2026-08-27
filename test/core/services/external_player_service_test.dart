@@ -20,10 +20,7 @@ void main() {
       const url = 'https://example.com/video.m3u8?token=a&quality=4k';
 
       expect(
-        ExternalPlayerService.instance.buildDesktopLaunchArguments(
-          player,
-          url,
-        ),
+        ExternalPlayerService.instance.buildDesktopLaunchArguments(player, url),
         ['--path=$url'],
       );
     });
