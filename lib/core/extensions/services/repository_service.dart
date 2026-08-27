@@ -140,44 +140,47 @@ class RepositoryService {
       .replaceAll('&quot;', '"')
       .trim();
 
-  /// Fetch and parse a Repository from a URL
+  /// Fetch and parse a Repository from a URL.
+  ///
+  /// SkyStream-native repositories may provide `packageName`/`id`. Standard
+  /// CloudStream repositories intentionally do not: the official format is
+  /// simply name + manifestVersion + pluginLists. The repository URL itself is
+  /// already used as a stable hashed namespace, so requiring an extra ID here
+  /// rejected valid Phisher/CNCVerse-style repositories for no safety benefit.
   Future<ExtensionRepository?> fetchRepository(String url) async {
     try {
-      // Resolve Shortcodes / Protocols
       final resolvedUrl = await parseRepoUrl(url);
       if (resolvedUrl == null) {
-        // Should be unreachable if parseRepoUrl throws, but for safety:
-        throw Exception("Failed to resolve URL");
+        throw Exception('Failed to resolve URL');
       }
 
-      // Handle raw github urls -> jsdelivr if needed
       final normalizedUrl = _normalizeUrl(resolvedUrl);
-
       final response = await _dio.request<String>(normalizedUrl);
       if (response.statusCode == 200 && response.data != null) {
-        final Map<String, dynamic>? data = response.data is String
-            ? _jsonDecodeSafe(response.data!) as Map<String, dynamic>?
-            : response.data as Map<String, dynamic>;
+        final decoded = response.data is String
+            ? _jsonDecodeSafe(response.data!)
+            : response.data;
+        final Map<String, dynamic>? data = decoded is Map
+            ? Map<String, dynamic>.from(decoded)
+            : null;
 
         if (data != null) {
-          // Validation: A valid repository must have a name, an ID, and either pluginLists or repos
-          final hasName = data.containsKey('name');
-          final hasId =
-              data.containsKey('id') || data.containsKey('packageName');
-          // Extract lists safely to check content
-          final plugins = (data['pluginLists'] as List?) ?? <dynamic>[];
+          final hasName = (data['name']?.toString().trim().isNotEmpty ?? false);
+          final pluginLists = (data['pluginLists'] as List?) ?? <dynamic>[];
           final repos = (data['repos'] as List?) ?? <dynamic>[];
-
-          final hasPlugins = plugins.isNotEmpty;
+          final directPlugins = (data['plugins'] as List?) ?? <dynamic>[];
+          final hasPluginLists = pluginLists.isNotEmpty;
           final hasRepos = repos.isNotEmpty;
+          final hasDirectPlugins = directPlugins.isNotEmpty;
 
-          if (!hasName || !hasId || (!hasPlugins && !hasRepos)) {
+          if (!hasName ||
+              (!hasPluginLists && !hasRepos && !hasDirectPlugins)) {
             throw Exception(
-              'Invalid repository format: Missing name, id/packageName, or plugin/repos',
+              'Invalid repository format: Missing name or pluginLists/repos/plugins',
             );
           }
 
-          if (hasPlugins && hasRepos) {
+          if (hasPluginLists && hasRepos) {
             throw Exception(
               "Repository cannot contain both 'pluginLists' and 'repos'. Please separate them.",
             );
@@ -191,17 +194,22 @@ class RepositoryService {
         debugPrint('Failed to fetch repository $url: $e');
       }
     } catch (e) {
-      // Rethrow validation exceptions or others
       rethrow;
     }
     return null;
   }
 
-  /// Fetch all plugin listed in a Repository
+  /// Fetch all plugins listed in a repository.
+  ///
+  /// CloudStream's SitePlugin schema uses `internalName` rather than
+  /// `packageName`, and points at a `.cs3` plus optional `jarUrl`. We retain
+  /// that metadata and synthesize a safe SkyStream-side package id so the
+  /// repository can be browsed without pretending the binary is a native
+  /// `.sky` JavaScript plugin. Runtime execution is supplied by the configured
+  /// CloudStream bridge add-on.
   Future<List<ExtensionPlugin>> getRepoPlugins(ExtensionRepository repo) async {
     final List<ExtensionPlugin> allPlugins = <ExtensionPlugin>[];
 
-    // Add plugins directly embedded in the repository manifest (Enterprise V2)
     allPlugins.addAll(repo.plugins);
 
     for (final pluginListUrl in repo.pluginLists) {
@@ -210,20 +218,28 @@ class RepositoryService {
         final response = await _dio.get<dynamic>(normalizedUrl);
 
         if (response.statusCode == 200 && response.data != null) {
-          final List<dynamic>? list = response.data is String
-              ? _jsonDecodeSafe(response.data as String) as List<dynamic>?
-              : response.data as List<dynamic>?;
+          final decoded = response.data is String
+              ? _jsonDecodeSafe(response.data as String)
+              : response.data;
+          final List<dynamic>? list = decoded is List ? decoded : null;
 
           if (list != null) {
-            final plugins = list
-                .map(
-                  (e) => ExtensionPlugin.fromJson(
-                    e as Map<String, dynamic>,
-                    repo.packageName,
-                  ),
-                )
-                .toList();
-            allPlugins.addAll(plugins);
+            for (final raw in list) {
+              if (raw is! Map) continue;
+              final source = Map<String, dynamic>.from(raw);
+              final normalized = _normalizePluginEntry(source, repo);
+              try {
+                allPlugins.add(
+                  ExtensionPlugin.fromJson(normalized, repo.packageName),
+                );
+              } catch (error) {
+                if (kDebugMode) {
+                  debugPrint(
+                    'Skipping invalid plugin entry from $pluginListUrl: $error',
+                  );
+                }
+              }
+            }
           }
         }
       } catch (e) {
@@ -236,7 +252,49 @@ class RepositoryService {
     return allPlugins;
   }
 
-  /// Download a plugin file to a temporary location
+  @visibleForTesting
+  Map<String, dynamic> normalizePluginEntryForTesting(
+    Map<String, dynamic> source,
+    ExtensionRepository repo,
+  ) => _normalizePluginEntry(source, repo);
+
+  Map<String, dynamic> _normalizePluginEntry(
+    Map<String, dynamic> source,
+    ExtensionRepository repo,
+  ) {
+    final result = Map<String, dynamic>.from(source);
+    final rawUrl = result['url']?.toString() ?? '';
+    final internalName = result['internalName']?.toString().trim() ?? '';
+    final hasJar = (result['jarUrl']?.toString().trim().isNotEmpty ?? false);
+    final isCloudStream =
+        internalName.isNotEmpty ||
+        rawUrl.toLowerCase().endsWith('.cs3') ||
+        hasJar;
+
+    if (isCloudStream) {
+      final seed = internalName.isNotEmpty
+          ? internalName
+          : (result['name']?.toString().trim().isNotEmpty ?? false)
+          ? result['name'].toString().trim()
+          : 'provider';
+      result['packageName'] ??=
+          'cloudstream.${repo.packageName}.${_safePackageSegment(seed)}';
+      result['cloudstream'] = true;
+      result['sourceFormat'] = 'cloudstream-cs3';
+      result['repositoryUrl'] ??= repo.url;
+    }
+
+    return result;
+  }
+
+  String _safePackageSegment(String value) {
+    var safe = value.replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_');
+    safe = safe.replaceAll(RegExp(r'^[._-]+'), '');
+    if (safe.isEmpty) safe = 'provider';
+    return safe;
+  }
+
+  /// Download a plugin file to a temporary location.
   Future<File?> downloadPlugin(String url) async {
     try {
       final normalizedUrl = _normalizeUrl(url);
