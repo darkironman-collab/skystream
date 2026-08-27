@@ -1,0 +1,140 @@
+name: CloudStream Local Backend
+
+on:
+  push:
+    branches:
+      - cloudstream-local-backend
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudstream-local-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-jvm:
+    name: Build and smoke-test JVM backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out SkyStream
+        uses: actions/checkout@v5
+
+      - name: Check out official CloudStream core
+        uses: actions/checkout@v5
+        with:
+          repository: recloudstream/cloudstream
+          ref: master
+          path: .cloudstream-upstream
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build local backend fat JAR
+        shell: bash
+        run: |
+          chmod +x .cloudstream-upstream/gradlew
+          .cloudstream-upstream/gradlew -p cloudstream_backend fatJar --stacktrace
+
+      - name: Start localhost backend
+        shell: bash
+        run: |
+          JAR=$(find cloudstream_backend/build/libs -name '*-all.jar' | head -n1)
+          test -f "$JAR"
+          java --add-modules jdk.httpserver -jar "$JAR" --port 47831 --token ci-token > backend.log 2>&1 &
+          echo $! > backend.pid
+          for i in {1..30}; do
+            if curl -fsS -H 'X-SkyStream-Token: ci-token' http://127.0.0.1:47831/health > health.json; then
+              cat health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          cat backend.log
+          exit 1
+
+      - name: Load a real Phisher JVM plugin
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request
+          url='https://raw.githubusercontent.com/phisher98/cloudstream-extensions-phisher/refs/heads/builds/plugins.json'
+          data=json.load(urllib.request.urlopen(url))
+          item=next(x for x in data if x.get('jarUrl'))
+          payload={k:item.get(k) for k in ('name','internalName','url','jarUrl','jarHash')}
+          open('plugin-install.json','w',encoding='utf-8').write(json.dumps(payload))
+          print('Testing', payload['name'], payload['jarUrl'])
+          PY
+          curl -fsS \
+            -H 'X-SkyStream-Token: ci-token' \
+            -H 'Content-Type: application/json' \
+            --data-binary @plugin-install.json \
+            http://127.0.0.1:47831/plugins/install | tee install-result.json
+          python3 - <<'PY'
+          import json
+          result=json.load(open('install-result.json',encoding='utf-8'))
+          assert result.get('ok') is True, result
+          assert result.get('providers'), result
+          print('Registered providers:', [x.get('name') for x in result['providers']])
+          PY
+
+      - name: Exercise provider search endpoint
+        shell: bash
+        run: |
+          PROVIDER=$(python3 - <<'PY'
+          import json
+          print(json.load(open('install-result.json'))['providers'][0]['name'])
+          PY
+          )
+          python3 - "$PROVIDER" <<'PY'
+          import json,sys
+          open('search.json','w').write(json.dumps({'query':'Avengers','provider':sys.argv[1]}))
+          PY
+          curl -fsS \
+            -H 'X-SkyStream-Token: ci-token' \
+            -H 'Content-Type: application/json' \
+            --data-binary @search.json \
+            http://127.0.0.1:47831/search | tee search-result.json
+
+      - name: Inspect CNCVerse Android-only CS3 package
+        shell: bash
+        run: |
+          curl -fL --retry 3 \
+            'https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/AniKoto.cs3' \
+            -o cnc-anikoto.cs3
+          unzip -l cnc-anikoto.cs3 | tee cnc-cs3-layout.txt
+          unzip -p cnc-anikoto.cs3 manifest.json | tee cnc-manifest.json
+          unzip -p cnc-anikoto.cs3 classes.dex > cnc-classes.dex
+          file cnc-classes.dex | tee cnc-dex-file.txt
+          test -s cnc-classes.dex
+
+      - name: Stop backend
+        if: always()
+        shell: bash
+        run: |
+          if [ -f backend.pid ]; then kill "$(cat backend.pid)" || true; fi
+
+      - name: Upload backend validation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudstream-local-backend-validation
+          path: |
+            cloudstream_backend/build/libs/*-all.jar
+            backend.log
+            health.json
+            plugin-install.json
+            install-result.json
+            search-result.json
+            cnc-cs3-layout.txt
+            cnc-manifest.json
+            cnc-dex-file.txt
+          if-no-files-found: ignore
+          retention-days: 7
