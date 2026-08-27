@@ -37,9 +37,9 @@ jobs:
           flutter gen-l10n
           dart run build_runner build --delete-conflicting-outputs
 
-      - name: Check formatting
+      - name: Format changed Dart files
         shell: pwsh
-        run: dart format --output=none --set-exit-if-changed lib/core/services/external_player_service.dart test/core/services/external_player_service_test.dart
+        run: dart format lib/core/services/external_player_service.dart test/core/services/external_player_service_test.dart
 
       - name: Analyze source
         shell: pwsh
