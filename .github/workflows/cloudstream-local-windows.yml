@@ -1,0 +1,283 @@
+name: SkyStream True Local CloudStream Windows
+
+on:
+  push:
+    branches:
+      - cloudstream-local-backend
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudstream-local-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Build Windows x64 with local CloudStream runtime
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out SkyStream
+        uses: actions/checkout@v5
+
+      - name: Check out official CloudStream core
+        uses: actions/checkout@v5
+        with:
+          repository: recloudstream/cloudstream
+          ref: master
+          path: .cloudstream-upstream
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build local CloudStream backend
+        shell: pwsh
+        run: |
+          & .\.cloudstream-upstream\gradlew.bat -p cloudstream_backend fatJar --stacktrace
+          $jar = Get-ChildItem cloudstream_backend\build\libs -Filter '*-all.jar' | Select-Object -First 1
+          if (-not $jar) { throw 'CloudStream backend fat JAR not found' }
+          Write-Host "Backend JAR: $($jar.FullName)"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Flutter project files
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter pub get
+          flutter gen-l10n
+          dart run build_runner build --delete-conflicting-outputs
+          dart format lib\core\extensions\services\cloudstream_backend_service.dart lib\core\extensions\providers\cloudstream_local_provider.dart lib\core\extensions\extension_manager.dart lib\features\extensions\providers\extensions_controller.dart
+
+      - name: Analyze source
+        shell: pwsh
+        run: flutter analyze --no-fatal-warnings
+
+      - name: Test extensions and Energy Media Player integration
+        shell: pwsh
+        run: flutter test test/core/extensions test/features/extensions test/core/services/external_player_service_test.dart test/compile_smoke_test.dart
+
+      - name: Keep only Windows TorrServer binary
+        shell: pwsh
+        run: |
+          Set-Location packages\flutter_torrent_server\assets\torrserver
+          Get-ChildItem -File | Where-Object { $_.Name -ne 'TorrServer-windows-amd64.exe' } | Remove-Item
+
+      - name: Download libmpv
+        shell: pwsh
+        run: |
+          choco install 7zip -y --no-progress
+          $assetPattern = '^mpv-dev-x86_64-(?!v\d+-)\d{8}-git-[a-f0-9]+\.7z$'
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest'
+          $asset = $release.assets | Where-Object { $_.name -match $assetPattern } | Select-Object -First 1
+          if (-not $asset) { throw "Could not find libmpv asset matching $assetPattern" }
+          $archivePath = Join-Path $env:RUNNER_TEMP 'mpv-dev.7z'
+          $extractDir = Join-Path $env:RUNNER_TEMP 'mpv-dev-extract'
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $archivePath
+          New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+          & 7z x $archivePath "-o$extractDir" -y | Out-Null
+          $dll = Get-ChildItem -Path $extractDir -Filter 'libmpv-2.dll' -Recurse | Select-Object -First 1
+          if (-not $dll) { throw 'libmpv-2.dll not found' }
+          "SKYSTREAM_WINDOWS_MPV_DLL=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Generate build configuration
+        shell: bash
+        run: |
+          cat > dart-defines.json << 'JSON_EOF'
+          {
+            "TMDB_API_KEY": "${{ secrets.TMDB_API_KEY }}",
+            "SIMKL_CLIENT_ID": "${{ secrets.SIMKL_CLIENT_ID }}",
+            "SIMKL_CLIENT_SECRET": "${{ secrets.SIMKL_CLIENT_SECRET }}",
+            "TRAKT_CLIENT_ID": "${{ secrets.TRAKT_CLIENT_ID }}",
+            "TRAKT_CLIENT_SECRET": "${{ secrets.TRAKT_CLIENT_SECRET }}",
+            "MAL_CLIENT_ID": "${{ secrets.MAL_CLIENT_ID }}",
+            "MAL_CLIENT_SECRET": "${{ secrets.MAL_CLIENT_SECRET }}",
+            "ANILIST_CLIENT_ID": "${{ secrets.ANILIST_CLIENT_ID }}",
+            "ANIMESKIP_CLIENT_ID": "${{ secrets.ANIMESKIP_CLIENT_ID }}"
+          }
+          JSON_EOF
+
+      - name: Build Flutter Windows release
+        shell: pwsh
+        run: flutter build windows --release --dart-define-from-file=dart-defines.json
+
+      - name: Bundle local backend JAR and Java runtime
+        shell: pwsh
+        run: |
+          $releaseDir = Resolve-Path 'build\windows\x64\runner\Release'
+          $backendDir = Join-Path $releaseDir 'cloudstream-backend'
+          New-Item -ItemType Directory -Path $backendDir -Force | Out-Null
+
+          $jar = Get-ChildItem cloudstream_backend\build\libs -Filter '*-all.jar' | Select-Object -First 1
+          Copy-Item $jar.FullName (Join-Path $backendDir 'skystream-cloudstream-backend-all.jar') -Force
+
+          $runtime = Join-Path $backendDir 'runtime'
+          & "$env:JAVA_HOME\bin\jlink.exe" --add-modules ALL-MODULE-PATH --strip-debug --no-header-files --no-man-pages --output $runtime
+          if (-not (Test-Path (Join-Path $runtime 'bin\java.exe'))) { throw 'Bundled Java runtime missing' }
+
+      - name: Bundle dex2jar for Android CS3 conversion
+        shell: pwsh
+        run: |
+          $releaseDir = Resolve-Path 'build\windows\x64\runner\Release'
+          $backendDir = Join-Path $releaseDir 'cloudstream-backend'
+          $zip = Join-Path $env:RUNNER_TEMP 'dex-tools-v2.4.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'dex-tools-v2.4'
+          Invoke-WebRequest -Uri 'https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $root = Get-ChildItem $extract -Directory -Recurse | Where-Object { Test-Path (Join-Path $_.FullName 'lib') } | Select-Object -First 1
+          if (-not $root) { throw 'dex2jar lib directory not found' }
+          $dest = Join-Path $backendDir 'dex2jar'
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          Copy-Item (Join-Path $root.FullName '*') $dest -Recurse -Force
+          if (-not (Test-Path (Join-Path $dest 'lib'))) { throw 'dex2jar bundle incomplete' }
+
+      - name: Smoke test packaged Phisher JVM plugin
+        shell: pwsh
+        run: |
+          $releaseDir = Resolve-Path 'build\windows\x64\runner\Release'
+          $java = Join-Path $releaseDir 'cloudstream-backend\runtime\bin\java.exe'
+          $jar = Join-Path $releaseDir 'cloudstream-backend\skystream-cloudstream-backend-all.jar'
+          $data = Join-Path $env:RUNNER_TEMP 'phisher-data'
+          New-Item -ItemType Directory -Path $data -Force | Out-Null
+          $proc = Start-Process -FilePath $java -ArgumentList @('--add-modules','jdk.httpserver','-jar',$jar,'--port','47834','--token','ci-token','--data-dir',$data) -PassThru -WindowStyle Hidden
+          try {
+            $headers = @{ 'X-SkyStream-Token' = 'ci-token' }
+            $ready = $false
+            1..30 | ForEach-Object {
+              if (-not $ready) {
+                try { $h = Invoke-RestMethod -Headers $headers -Uri 'http://127.0.0.1:47834/health'; if ($h.ok) { $ready = $true } } catch { Start-Sleep -Seconds 1 }
+              }
+            }
+            if (-not $ready) { throw 'Packaged backend did not start' }
+            $plugins = Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/phisher98/cloudstream-extensions-phisher/refs/heads/builds/plugins.json'
+            $item = $plugins | Where-Object { $_.jarUrl } | Select-Object -First 1
+            if (-not $item) { throw 'No Phisher jarUrl plugin found' }
+            $payload = @{
+              name = $item.name
+              internalName = $item.internalName
+              url = $item.url
+              jarUrl = $item.jarUrl
+              jarHash = $item.jarHash
+            } | ConvertTo-Json
+            $result = Invoke-RestMethod -Method Post -Headers $headers -ContentType 'application/json' -Body $payload -Uri 'http://127.0.0.1:47834/plugins/install'
+            $result | ConvertTo-Json -Depth 8 | Out-File phisher-smoke.json
+            if (-not $result.ok) { throw "Phisher local load failed: $($result.message)" }
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Smoke test CNCVerse DEX conversion locally
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $releaseDir = Resolve-Path 'build\windows\x64\runner\Release'
+          $java = Join-Path $releaseDir 'cloudstream-backend\runtime\bin\java.exe'
+          $backendJar = Join-Path $releaseDir 'cloudstream-backend\skystream-cloudstream-backend-all.jar'
+          $dexRoot = Join-Path $releaseDir 'cloudstream-backend\dex2jar'
+          $work = Join-Path $env:RUNNER_TEMP 'cnc-dex'
+          $data = Join-Path $env:RUNNER_TEMP 'cnc-data'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $data 'plugins') -Force | Out-Null
+
+          $cs3 = Join-Path $work 'AniKoto.cs3'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/AniKoto.cs3' -OutFile $cs3
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($cs3)
+          try {
+            $entry = $zip.GetEntry('classes.dex')
+            if (-not $entry) { throw 'AniKoto CS3 classes.dex missing' }
+            $dex = Join-Path $work 'AniKoto.dex'
+            $input = $entry.Open()
+            $output = [System.IO.File]::Create($dex)
+            try { $input.CopyTo($output) } finally { $output.Dispose(); $input.Dispose() }
+          } finally { $zip.Dispose() }
+
+          $converted = Join-Path $data 'plugins\AniKoto.jar'
+          & $java -cp (Join-Path $dexRoot 'lib\*') com.googlecode.dex2jar.tools.Dex2jarCmd -f -o $converted $dex
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $converted)) { throw 'AniKoto DEX conversion failed' }
+
+          $proc = Start-Process -FilePath $java -ArgumentList @('--add-modules','jdk.httpserver','-jar',$backendJar,'--port','47835','--token','ci-token','--data-dir',$data) -PassThru -WindowStyle Hidden
+          try {
+            $headers = @{ 'X-SkyStream-Token' = 'ci-token' }
+            $ready = $false
+            1..30 | ForEach-Object {
+              if (-not $ready) {
+                try { $h = Invoke-RestMethod -Headers $headers -Uri 'http://127.0.0.1:47835/health'; if ($h.ok) { $ready = $true } } catch { Start-Sleep -Seconds 1 }
+              }
+            }
+            if (-not $ready) { throw 'Backend did not start with CNC converted JAR' }
+            $providers = Invoke-RestMethod -Headers $headers -Uri 'http://127.0.0.1:47835/providers'
+            $providers | ConvertTo-Json -Depth 8 | Out-File cnc-smoke.json
+            $names = @($providers.providers | ForEach-Object { $_.name })
+            if (-not ($names | Where-Object { $_ -match 'AniKoto' })) { throw "AniKoto provider did not load locally. Providers: $($names -join ', ')" }
+          } finally {
+            if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          }
+
+      - name: Build installer and portable ZIP
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $appDir = '..\..\..\build\windows\x64\runner\Release'
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' /DAppVersion=2.7.6-local-cs /DAppArch=x64 /DAppDir=$appDir windows\packaging\exe\setup.iss
+          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath SkyStream-True-CloudStream-Windows-x64-Portable.zip
+
+      - name: Stage build outputs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifact -Force | Out-Null
+          Copy-Item windows\packaging\exe\Output\*.exe artifact\
+          Copy-Item SkyStream-True-CloudStream-Windows-x64-Portable.zip artifact\
+          Copy-Item phisher-smoke.json artifact\ -ErrorAction SilentlyContinue
+          Copy-Item cnc-smoke.json artifact\ -ErrorAction SilentlyContinue
+
+      - name: Upload unscanned Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: skystream-true-cloudstream-windows-unscanned
+          path: artifact/
+          retention-days: 3
+
+  malware-scan:
+    name: ClamAV scan and checksums
+    needs: build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: skystream-true-cloudstream-windows-unscanned
+          path: artifact
+
+      - name: Install and update ClamAV
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam.service || true
+          sudo freshclam
+
+      - name: Scan and create SHA-256 checksums
+        shell: bash
+        working-directory: artifact
+        run: |
+          clamscan --recursive --infected --log=CLAMAV-SCAN.txt .
+          sha256sum *.exe *.zip > SHA256SUMS.txt
+
+      - name: Upload verified Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: SkyStream-True-CloudStream-Windows-x64-verified
+          path: artifact/
+          retention-days: 7
