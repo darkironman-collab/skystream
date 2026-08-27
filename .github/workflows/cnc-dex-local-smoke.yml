@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - cloudstream-local-backend
+      - cnc-intent-shim-test
     paths:
       - '.github/workflows/cnc-dex-local-smoke.yml'
       - 'cloudstream_backend/**'
@@ -94,6 +95,7 @@ jobs:
       - name: Verify AniKoto provider registered locally
         shell: bash
         run: |
+          cat backend-cnc.log || true
           curl -fsS -H 'X-SkyStream-Token: ci-token' \
             http://127.0.0.1:47832/providers | tee providers-cnc.json
           python3 - <<'PY'
