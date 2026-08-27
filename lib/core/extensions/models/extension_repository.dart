@@ -26,14 +26,25 @@ class ExtensionRepository {
   }) : _explicitId = explicitId;
 
   /// The Package Namespace.
-  /// Returns explicit Package Name or falls back to Hash(Url).
+  /// Returns explicit package/id or falls back to Hash(Url).
+  ///
+  /// The hash fallback is important for the official CloudStream repository
+  /// shape, which intentionally does not require an `id` or `packageName`.
   String get packageName =>
       _explicitId ??
       sha256.convert(utf8.encode(url)).toString().substring(0, 10);
 
   /// Factory constructor to parse from JSON
   factory ExtensionRepository.fromJson(Map<String, dynamic> json, String url) {
-    final repoId = json['packageName'] as String? ?? 'Unknown';
+    final explicitId =
+        json['packageName']?.toString().trim().isNotEmpty == true
+        ? json['packageName'].toString().trim()
+        : json['id']?.toString().trim().isNotEmpty == true
+        ? json['id'].toString().trim()
+        : null;
+    final repoId = explicitId ??
+        sha256.convert(utf8.encode(url)).toString().substring(0, 10);
+
     return ExtensionRepository(
       name: json['name'] as String? ?? 'Unknown Repository',
       url: url,
@@ -49,16 +60,19 @@ class ExtensionRepository {
           [],
       plugins:
           (json['plugins'] as List<dynamic>?)
-              ?.map(
-                (e) =>
-                    ExtensionPlugin.fromJson(e as Map<String, dynamic>, repoId),
+              ?.whereType<Map<dynamic, dynamic>>()
+              .map(
+                (e) => ExtensionPlugin.fromJson(
+                  Map<String, dynamic>.from(e),
+                  repoId,
+                ),
               )
               .toList() ??
           [],
       description: json['description'] as String?,
       iconUrl: json['iconUrl'] as String?,
       manifestVersion: json['manifestVersion'] as int? ?? 1,
-      explicitId: json['packageName'] as String?,
+      explicitId: explicitId,
     );
   }
 }
