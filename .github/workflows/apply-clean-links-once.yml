@@ -1,0 +1,62 @@
+name: Apply clean-links patch once
+
+on:
+  push:
+    branches:
+      - cloudstream-clean-links-20260827
+    paths:
+      - tools/apply_clean_links_patch.py
+      - .github/workflows/apply-clean-links-once.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clean-links-patch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apply-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out working branch
+        uses: actions/checkout@v5
+        with:
+          ref: cloudstream-clean-links-20260827
+          fetch-depth: 0
+
+      - name: Apply guarded patch
+        run: python3 tools/apply_clean_links_patch.py
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate and format
+        run: |
+          flutter pub get
+          flutter gen-l10n
+          dart format lib/core/services/external_player_service.dart lib/core/utils/m3u_export.dart lib/features/sources/presentation/plugin_sources_sheet.dart test/core/utils/m3u_export_test.dart
+
+      - name: Analyze
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+
+      - name: Test clean-link changes
+        run: flutter test test/core/utils/m3u_export_test.dart test/core/extensions test/features/extensions test/compile_smoke_test.dart
+
+      - name: Remove one-shot helpers and commit validated changes
+        shell: bash
+        run: |
+          rm -f tools/apply_clean_links_patch.py .github/workflows/apply-clean-links-once.yml
+          git config user.name "SkyStream Clean Links Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "feat: hide dead links and export verified M3U"
+          git push origin HEAD:cloudstream-clean-links-20260827
