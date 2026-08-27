@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
@@ -48,6 +49,70 @@ void main() {
             ..headers.set('location', 'https://cutt.ly/404');
         case '/missing':
           request.response.statusCode = 404;
+        case '/phisher-repo':
+          request.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(
+              jsonEncode({
+                'name': 'Phisher Repo',
+                'description': 'Phisher Repository',
+                'manifestVersion': 1,
+                'pluginLists': ['$base/phisher-plugins'],
+              }),
+            );
+        case '/cnc-repo':
+          request.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(
+              jsonEncode({
+                'name': 'CNC Repo(All Language)',
+                'description': 'All Language Contents',
+                'manifestVersion': 1,
+                'pluginLists': ['$base/cnc-plugins'],
+              }),
+            );
+        case '/phisher-plugins':
+          request.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(
+              jsonEncode([
+                {
+                  'url': 'https://example.com/AllWish.cs3',
+                  'jarUrl': 'https://example.com/AllWish.jar',
+                  'status': 1,
+                  'version': 15,
+                  'name': 'AllWish',
+                  'internalName': 'AllWish',
+                  'authors': ['Phisher98'],
+                  'description': 'Anime provider',
+                  'language': 'en',
+                  'tvTypes': ['Anime'],
+                },
+              ]),
+            );
+        case '/cnc-plugins':
+          request.response
+            ..statusCode = 200
+            ..headers.contentType = ContentType.json
+            ..write(
+              jsonEncode([
+                {
+                  'url': 'https://example.com/CNCProvider.cs3',
+                  'jarUrl': 'https://example.com/CNCProvider.jar',
+                  'status': 1,
+                  'version': 7,
+                  'name': 'CNC Provider',
+                  'internalName': 'CNCProvider',
+                  'authors': ['CNCVerse'],
+                  'description': 'Multi-language provider',
+                  'language': 'hi',
+                  'tvTypes': ['Movie', 'TvSeries'],
+                },
+              ]),
+            );
         default:
           request.response.statusCode = 404;
       }
@@ -127,6 +192,44 @@ void main() {
         service.unescapeHtml('https://e.com/a.json?x=1&amp;y=2'),
         'https://e.com/a.json?x=1&y=2',
       );
+    });
+  });
+
+  group('CloudStream repository compatibility', () {
+    test('accepts Phisher standard repo without id/packageName', () async {
+      final repo = await service.fetchRepository('$base/phisher-repo');
+      expect(repo, isNotNull);
+      expect(repo!.name, 'Phisher Repo');
+      expect(repo.packageName, isNotEmpty);
+      expect(repo.pluginLists, ['$base/phisher-plugins']);
+
+      final plugins = await service.getRepoPlugins(repo);
+      expect(plugins, hasLength(1));
+      expect(plugins.single.name, 'AllWish');
+      expect(plugins.single.packageName, startsWith('cloudstream.'));
+      expect(plugins.single.sourceUrl, endsWith('.cs3'));
+      expect(plugins.single.languages, ['en']);
+      expect(plugins.single.categories, ['Anime']);
+      expect(plugins.single.manifest['cloudstream'], isTrue);
+      expect(plugins.single.manifest['sourceFormat'], 'cloudstream-cs3');
+      expect(plugins.single.manifest['jarUrl'], endsWith('.jar'));
+    });
+
+    test('accepts CNCVerse standard repo and normalizes plugin metadata', () async {
+      final repo = await service.fetchRepository('$base/cnc-repo');
+      expect(repo, isNotNull);
+      expect(repo!.name, 'CNC Repo(All Language)');
+      expect(repo.packageName, isNotEmpty);
+
+      final plugins = await service.getRepoPlugins(repo);
+      expect(plugins, hasLength(1));
+      expect(plugins.single.name, 'CNC Provider');
+      expect(plugins.single.packageName, contains('CNCProvider'));
+      expect(plugins.single.sourceUrl, endsWith('.cs3'));
+      expect(plugins.single.languages, ['hi']);
+      expect(plugins.single.categories, ['Movie', 'TvSeries']);
+      expect(plugins.single.manifest['cloudstream'], isTrue);
+      expect(plugins.single.manifest['repositoryUrl'], '$base/cnc-repo');
     });
   });
 }
