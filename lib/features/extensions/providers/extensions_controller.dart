@@ -10,9 +10,17 @@ import '../../../../core/extensions/models/extension_plugin.dart';
 import '../../../../core/extensions/models/extension_repository.dart';
 import '../../../../core/extensions/extension_manager.dart';
 import '../../../../core/extensions/providers.dart';
+import '../../../../core/extensions/services/cloudstream_backend_service.dart';
+import '../../../../core/addons/data/addon_repository.dart';
 import '../../../core/storage/settings_repository.dart';
 
 part 'extensions_controller.g.dart';
+
+@visibleForTesting
+bool isCloudStreamExtensionPlugin(ExtensionPlugin plugin) =>
+    plugin.manifest['cloudstream'] == true ||
+    plugin.manifest['sourceFormat'] == 'cloudstream-cs3' ||
+    plugin.sourceUrl.toLowerCase().endsWith('.cs3');
 
 // State for the Extensions Screen (Sealed Class Hierarchy)
 sealed class ExtensionsState {
@@ -78,6 +86,29 @@ class ExtensionsController extends _$ExtensionsController {
     if (_initialized) return;
     _initialized = true;
     await _init();
+  }
+
+  String? _streamXBridgeManifestUrl() {
+    final addons = ref.read(addonRepositoryProvider).enabled;
+    for (final addon in addons) {
+      final manifest = addon.manifest;
+      if (manifest == null) continue;
+      final fingerprint = [
+        manifest.id,
+        manifest.name,
+        manifest.description,
+        addon.manifestUrl,
+      ].join(' ').toLowerCase();
+      final hasStreams = manifest.resources.any((r) => r.name == 'stream');
+      final looksLikeStreamX =
+          fingerprint.contains('stream x') ||
+          fingerprint.contains('streamx') ||
+          fingerprint.contains('cloudstream bridge') ||
+          fingerprint.contains('extremeos') ||
+          fingerprint.contains('/provider/');
+      if (hasStreams && looksLikeStreamX) return addon.manifestUrl;
+    }
+    return null;
   }
 
   Future<void> _init() async {
@@ -461,6 +492,71 @@ class ExtensionsController extends _$ExtensionsController {
       final storageService = ref.read(pluginStorageServiceProvider);
 
       for (final plugin in plugins) {
+        if (isCloudStreamExtensionPlugin(plugin)) {
+          final backend = ref.read(cloudStreamBackendServiceProvider);
+          final result = await backend.installPlugin(plugin);
+          final status = result['status']?.toString() ?? 'error';
+
+          String runtimeMode;
+          String? bridgeManifestUrl;
+          if (result['ok'] == true) {
+            runtimeMode = 'jvm';
+          } else if (status == 'android_only') {
+            bridgeManifestUrl = _streamXBridgeManifestUrl();
+            if (bridgeManifestUrl == null) {
+              throw Exception(
+                '${plugin.name} is an Android-only CloudStream provider. '
+                'Install/enable your Stream X Bridge manifest in Add-ons, then retry. '
+                'SkyStream will delegate this provider to the bridge instead of trying '
+                'to execute Android DEX on Windows.',
+              );
+            }
+            runtimeMode = 'bridge';
+          } else {
+            final message = result['message']?.toString();
+            throw Exception(
+              message == null || message.isEmpty
+                  ? 'CloudStream provider installation failed ($status).'
+                  : message,
+            );
+          }
+
+          final targetPlugin = await storageService.installCloudStreamMetadata(
+            plugin,
+            runtimeMode: runtimeMode,
+            bridgeManifestUrl: bridgeManifestUrl,
+          );
+
+          await ref
+              .read(extensionManagerProvider.notifier)
+              .reloadPlugin(targetPlugin);
+
+          final newUpdates = Map<String, ExtensionPlugin>.from(
+            state.availableUpdates,
+          )..remove(targetPlugin.packageName);
+          final currentInstalling = Set<String>.from(state.installingPlugins)
+            ..remove(targetPlugin.packageName);
+          final newInstalled = List<ExtensionPlugin>.from(
+            state.installedPlugins,
+          );
+          final existingIndex = newInstalled.indexWhere(
+            (p) => p.packageName == targetPlugin.packageName,
+          );
+          if (existingIndex >= 0) {
+            newInstalled[existingIndex] = targetPlugin;
+          } else {
+            newInstalled.add(targetPlugin);
+          }
+          state = ExtensionsSuccess(
+            installedPlugins: newInstalled,
+            repositories: state.repositories,
+            availablePlugins: state.availablePlugins,
+            availableUpdates: newUpdates,
+            installingPlugins: currentInstalling,
+          );
+          continue;
+        }
+
         File? savedFile;
 
         // Standard HTTP Download
@@ -551,7 +647,19 @@ class ExtensionsController extends _$ExtensionsController {
 
   Future<void> uninstallPlugin(ExtensionPlugin plugin) async {
     final storageService = ref.read(pluginStorageServiceProvider);
+    final isCloudStream = isCloudStreamExtensionPlugin(plugin);
     await storageService.deletePlugin(plugin);
+    if (isCloudStream) {
+      // A JVM cannot unload arbitrary plugin classloaders safely. Restart the
+      // localhost sidecar, then the normal extension sync re-registers only
+      // the CloudStream plugins that are still installed.
+      await ref.read(cloudStreamBackendServiceProvider).restart();
+    }
     await loadInstalledPlugins();
+    if (isCloudStream) {
+      await ref
+          .read(extensionManagerProvider.notifier)
+          .syncFromPlugins(state.installedPlugins);
+    }
   }
 }

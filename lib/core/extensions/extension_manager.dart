@@ -8,13 +8,27 @@ import 'dart:io';
 import 'engine/js_engine.dart';
 import 'models/extension_plugin.dart';
 import 'providers/js_based_provider.dart';
+import 'providers/cloudstream_local_provider.dart';
 import 'services/plugin_storage_service.dart';
+import 'services/cloudstream_backend_service.dart';
 import 'providers.dart';
 import '../storage/settings_repository.dart';
 import '../storage/extension_repository.dart';
 import '../logger/app_logger.dart';
 
 part 'extension_manager.g.dart';
+
+bool _isCloudStreamPlugin(ExtensionPlugin plugin) =>
+    plugin.manifest['cloudstream'] == true ||
+    plugin.manifest['sourceFormat'] == 'cloudstream-cs3' ||
+    plugin.sourceUrl.toLowerCase().endsWith('.cs3');
+
+bool _isLocalJvmCloudStreamPlugin(ExtensionPlugin plugin) {
+  if (!_isCloudStreamPlugin(plugin)) return false;
+  if (plugin.manifest['runtimeMode'] == 'bridge') return false;
+  final jarUrl = plugin.manifest['jarUrl']?.toString().trim() ?? '';
+  return jarUrl.isNotEmpty;
+}
 
 @Riverpod(keepAlive: true)
 class ExtensionManager extends _$ExtensionManager {
@@ -244,13 +258,22 @@ class ExtensionManager extends _$ExtensionManager {
           final results = await Future.wait(batchLoads);
           final loadedInBatch = results.expand((l) => l).toList();
           if (loadedInBatch.isNotEmpty) {
-            state = [...state, ...loadedInBatch];
+            final next = List<SkyStreamProvider>.from(state);
+            for (final provider in loadedInBatch) {
+              if (!next.any((p) => p.packageName == provider.packageName)) {
+                next.add(provider);
+              }
+            }
+            state = next;
           }
         }
       }
 
       // Unload Removed Plugins
       final installedPackageNames = installed.map((e) => e.packageName).toSet();
+      if (installed.any(_isLocalJvmCloudStreamPlugin)) {
+        installedPackageNames.add(CloudStreamLocalProvider.runtimePackageName);
+      }
 
       final providersToRemove = <SkyStreamProvider>[];
 
@@ -328,6 +351,48 @@ class ExtensionManager extends _$ExtensionManager {
     return saved == null || saved == 'true';
   }
 
+  Future<List<SkyStreamProvider>> _loadCloudStreamPlugin(
+    ExtensionPlugin plugin,
+  ) async {
+    // Android/Dex-only providers are consumed through the user's enabled
+    // Stream X Stremio add-on. They deliberately do not create a fake local
+    // provider or try to evaluate a .cs3 as JavaScript.
+    if (plugin.manifest['runtimeMode'] == 'bridge') return const [];
+
+    final backend = ref.read(cloudStreamBackendServiceProvider);
+    final result = await backend.installPlugin(plugin);
+    if (result['ok'] == true) {
+      if (state.any(
+        (p) => p.packageName == CloudStreamLocalProvider.runtimePackageName,
+      )) {
+        return const [];
+      }
+      return [CloudStreamLocalProvider(backend)];
+    }
+
+    // On application restart the backend preloads persisted JARs before the
+    // Dart extension manager syncs. Re-installing the same JAR may therefore
+    // report `no_provider` even though its provider is already active. Treat
+    // a non-empty backend provider list as a healthy, idempotent runtime.
+    final activeProviders = await backend.providers();
+    if (activeProviders.isNotEmpty) {
+      if (state.any(
+        (p) => p.packageName == CloudStreamLocalProvider.runtimePackageName,
+      )) {
+        return const [];
+      }
+      return [CloudStreamLocalProvider(backend)];
+    }
+
+    if (kDebugMode) {
+      debugPrint(
+        'CloudStream local load failed for ${plugin.name}: '
+        '${result['status']} ${result['message']}',
+      );
+    }
+    return const [];
+  }
+
   /// Registers shell providers for a plugin. JS is NOT evaluated here — it is
   /// loaded lazily on the first search/getHome/getDetails/loadStreams call.
   /// Sub-providers sharing the same JS file reuse one shared read Future so the
@@ -338,6 +403,9 @@ class ExtensionManager extends _$ExtensionManager {
   /// the live list, then fan-out into sub-providers exactly like the static path.
   Future<List<SkyStreamProvider>> _loadPlugin(ExtensionPlugin plugin) async {
     if (_engine == null || _storageService == null) return [];
+    if (_isCloudStreamPlugin(plugin)) {
+      return _loadCloudStreamPlugin(plugin);
+    }
     try {
       // Integrity check (PR-08c): SHA-256 verification of plugin.js against
       // meta.json's installSha256. DISABLED per project decision 2026-05-25 —

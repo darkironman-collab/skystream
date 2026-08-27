@@ -51,6 +51,11 @@ class CloudStreamBackendService {
     return _startFuture ??= _start();
   }
 
+  Future<bool> restart() async {
+    await dispose();
+    return ensureStarted();
+  }
+
   Future<bool> _start() async {
     if (_process != null && _port != null) {
       if (await _health()) return true;

@@ -240,6 +240,72 @@ class PluginStorageService {
     return plugin;
   }
 
+  /// Persists a CloudStream repository entry without extracting its Android
+  /// `.cs3` package as a SkyStream `.sky` archive. The executable provider
+  /// code is owned by either the localhost JVM runtime (`runtimeMode=jvm`) or
+  /// the configured Stream X/Stremio bridge (`runtimeMode=bridge`).
+  Future<ExtensionPlugin> installCloudStreamMetadata(
+    ExtensionPlugin plugin, {
+    required String runtimeMode,
+    String? bridgeManifestUrl,
+  }) async {
+    if (!isSafePluginPackageName(plugin.packageName)) {
+      throw Exception(
+        'Unsafe CloudStream package name: ${plugin.packageName}',
+      );
+    }
+
+    final rootDir = await _pluginsDir;
+    final targetPath = resolvePluginPathWithin(rootDir.path, plugin.packageName);
+    if (targetPath == null) {
+      throw Exception('CloudStream package path escapes the plugin directory');
+    }
+
+    final targetDir = Directory(targetPath);
+    final stagingDir = Directory(
+      p.join(
+        rootDir.path,
+        '.tmp-cloudstream-${plugin.packageName}-${DateTime.now().millisecondsSinceEpoch}',
+      ),
+    );
+    await stagingDir.create(recursive: true);
+
+    try {
+      final meta = Map<String, dynamic>.from(plugin.manifest);
+      meta['packageName'] = plugin.packageName;
+      meta['name'] = plugin.name;
+      meta['url'] = plugin.sourceUrl;
+      meta['version'] = plugin.version;
+      meta['status'] = plugin.status;
+      meta['repositoryId'] = plugin.repositoryId;
+      meta['cloudstream'] = true;
+      meta['sourceFormat'] = 'cloudstream-cs3';
+      meta['runtimeMode'] = runtimeMode;
+      if (bridgeManifestUrl != null && bridgeManifestUrl.isNotEmpty) {
+        meta['bridgeManifestUrl'] = bridgeManifestUrl;
+      } else {
+        meta.remove('bridgeManifestUrl');
+      }
+
+      await File(p.join(stagingDir.path, 'meta.json')).writeAsString(
+        jsonEncode(meta),
+      );
+
+      if (await targetDir.exists()) {
+        await targetDir.delete(recursive: true);
+      }
+      await stagingDir.rename(targetDir.path);
+      return ExtensionPlugin.fromJson(meta, plugin.repositoryId);
+    } catch (_) {
+      try {
+        if (await stagingDir.exists()) {
+          await stagingDir.delete(recursive: true);
+        }
+      } catch (_) {}
+      rethrow;
+    }
+  }
+
   /// Deletes a plugin directory (by Package Name).
   ///
   /// Containment-checked rather than format-checked: a plugin already on disk
