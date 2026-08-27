@@ -1,0 +1,146 @@
+name: CNCVerse Local DEX Smoke Test
+
+on:
+  push:
+    branches:
+      - cloudstream-local-backend
+    paths:
+      - '.github/workflows/cnc-dex-local-smoke.yml'
+      - 'cloudstream_backend/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cnc-dex-local-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cnc-local:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out SkyStream
+        uses: actions/checkout@v5
+
+      - name: Check out official CloudStream core
+        uses: actions/checkout@v5
+        with:
+          repository: recloudstream/cloudstream
+          ref: master
+          path: .cloudstream-upstream
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Build local backend
+        shell: bash
+        run: |
+          chmod +x .cloudstream-upstream/gradlew
+          .cloudstream-upstream/gradlew -p cloudstream_backend fatJar --stacktrace
+          find cloudstream_backend/build/libs -name '*-all.jar' -print
+
+      - name: Download dex2jar and CNCVerse AniKoto
+        shell: bash
+        run: |
+          curl -fL --retry 3 \
+            'https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip' \
+            -o dex-tools.zip
+          unzip -q dex-tools.zip -d dex2jar
+          curl -fL --retry 3 \
+            'https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/AniKoto.cs3' \
+            -o AniKoto.cs3
+          unzip -p AniKoto.cs3 classes.dex > AniKoto.dex
+          unzip -p AniKoto.cs3 manifest.json | tee AniKoto-manifest.json
+          test -s AniKoto.dex
+
+      - name: Convert CNCVerse DEX to JVM JAR
+        shell: bash
+        run: |
+          DEXROOT=$(find dex2jar -type d -name lib -printf '%h\n' | head -n1)
+          test -n "$DEXROOT"
+          java -cp "$DEXROOT/lib/*" com.googlecode.dex2jar.tools.Dex2jarCmd \
+            -f -o AniKoto-jvm.jar AniKoto.dex
+          test -s AniKoto-jvm.jar
+          jar tf AniKoto-jvm.jar | tee AniKoto-jvm-classes.txt
+          grep -q 'com/anikoto/AnikotoPlugin.class' AniKoto-jvm-classes.txt
+
+      - name: Start backend with converted CNCVerse JAR
+        shell: bash
+        run: |
+          mkdir -p backend-data/plugins
+          cp AniKoto-jvm.jar backend-data/plugins/AniKoto.jar
+          JAR=$(find cloudstream_backend/build/libs -name '*-all.jar' | head -n1)
+          java --add-modules jdk.httpserver -jar "$JAR" \
+            --port 47832 --token ci-token --data-dir "$PWD/backend-data" \
+            > backend-cnc.log 2>&1 &
+          echo $! > backend-cnc.pid
+          for i in {1..30}; do
+            if curl -fsS -H 'X-SkyStream-Token: ci-token' \
+              http://127.0.0.1:47832/health > health-cnc.json; then
+              cat health-cnc.json
+              exit 0
+            fi
+            sleep 1
+          done
+          cat backend-cnc.log
+          exit 1
+
+      - name: Verify AniKoto provider registered locally
+        shell: bash
+        run: |
+          curl -fsS -H 'X-SkyStream-Token: ci-token' \
+            http://127.0.0.1:47832/providers | tee providers-cnc.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('providers-cnc.json',encoding='utf-8'))
+          names=[str(x.get('name','')) for x in data.get('providers',[])]
+          print('Providers:', names)
+          assert any('anikoto' in n.lower() for n in names), names
+          PY
+
+      - name: Exercise AniKoto search
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          data=json.load(open('providers-cnc.json',encoding='utf-8'))
+          provider=next(x['name'] for x in data['providers'] if 'anikoto' in x['name'].lower())
+          open('cnc-search.json','w').write(json.dumps({'query':'One Piece','provider':provider}))
+          PY
+          curl -fsS \
+            -H 'X-SkyStream-Token: ci-token' \
+            -H 'Content-Type: application/json' \
+            --data-binary @cnc-search.json \
+            http://127.0.0.1:47832/search | tee cnc-search-result.json
+          python3 - <<'PY'
+          import json
+          data=json.load(open('cnc-search-result.json',encoding='utf-8'))
+          assert 'results' in data, data
+          print('Result count:', len(data.get('results',[])))
+          PY
+
+      - name: Stop backend
+        if: always()
+        shell: bash
+        run: |
+          if [ -f backend-cnc.pid ]; then kill "$(cat backend-cnc.pid)" || true; fi
+
+      - name: Upload CNC validation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnc-dex-local-validation
+          path: |
+            AniKoto-manifest.json
+            AniKoto-jvm-classes.txt
+            providers-cnc.json
+            cnc-search-result.json
+            backend-cnc.log
+          if-no-files-found: ignore
+          retention-days: 7
