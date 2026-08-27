@@ -19,6 +19,8 @@ class ExternalPlayer {
   androidAction; // e.g. 'org.videolan.vlc.player.VideoPlayerActivity'
   final String? iosScheme; // e.g. 'vlc://'
   final String? desktopCommand; // e.g. 'vlc'
+  final List<String> desktopCommandAliases;
+  final String desktopUrlArgumentPrefix;
   final String? macAppName; // e.g. 'VLC' for `open -a VLC`
 
   const ExternalPlayer({
@@ -30,6 +32,8 @@ class ExternalPlayer {
     this.androidAction,
     this.iosScheme,
     this.desktopCommand,
+    this.desktopCommandAliases = const [],
+    this.desktopUrlArgumentPrefix = '',
     this.macAppName,
   });
 }
@@ -118,6 +122,18 @@ class ExternalPlayerService {
         TargetPlatform.linux,
       },
       desktopCommand: 'mpv',
+    ),
+    // Both Microsoft Store variants expose an execution alias. The Windows
+    // edition is preferred, while the Xbox-compatible edition remains a
+    // transparent fallback. EMP requires the stream URL as --path=<url>.
+    ExternalPlayer(
+      id: 'energy_media_player',
+      displayName: 'Energy Media Player',
+      icon: Icons.bolt_rounded,
+      supportedPlatforms: {TargetPlatform.windows},
+      desktopCommand: 'EnergyPlayerForWindows.exe',
+      desktopCommandAliases: ['EnergyPlayer.exe'],
+      desktopUrlArgumentPrefix: '--path=',
     ),
     ExternalPlayer(
       id: 'iina',
@@ -328,9 +344,11 @@ class ExternalPlayerService {
       }
       if (player.desktopCommand != null) {
         if (await _isCommandAvailable(player.desktopCommand!)) {
-          await Process.start(player.desktopCommand!, [
-            videoUrl,
-          ], mode: ProcessStartMode.detached);
+          await Process.start(
+            player.desktopCommand!,
+            buildDesktopLaunchArguments(player, videoUrl),
+            mode: ProcessStartMode.detached,
+          );
           return true;
         }
       }
@@ -364,34 +382,49 @@ class ExternalPlayerService {
   };
 
   Future<bool> _launchWindows(String videoUrl, ExternalPlayer player) async {
-    final command = player.desktopCommand;
-    if (command == null) return false;
-    try {
-      // 1. Try running by command name (works if it's in PATH)
-      try {
-        if (await _isCommandAvailable(command)) {
-          await Process.start(command, [
-            videoUrl,
-          ], mode: ProcessStartMode.detached);
-          return true;
-        }
-      } catch (_) {
-        // Not in PATH — try common install directories
-      }
+    final primaryCommand = player.desktopCommand;
+    if (primaryCommand == null) return false;
 
-      // 2. Try known install paths
-      final knownPaths = _windowsPlayerPaths[command] ?? [];
-      for (final exePath in knownPaths) {
+    final commands = <String>{
+      primaryCommand,
+      ...player.desktopCommandAliases,
+    };
+    final arguments = buildDesktopLaunchArguments(player, videoUrl);
+
+    try {
+      // 1. Try every execution alias by command name (works if it is in PATH).
+      for (final command in commands) {
         try {
-          final f = File(exePath);
-          if (await f.exists()) {
-            await Process.start(exePath, [
-              videoUrl,
-            ], mode: ProcessStartMode.detached);
+          if (await _isCommandAvailable(command)) {
+            await Process.start(
+              command,
+              arguments,
+              mode: ProcessStartMode.detached,
+            );
             return true;
           }
         } catch (_) {
-          continue;
+          // Try the next alias, then the known installation paths below.
+        }
+      }
+
+      // 2. Try known install paths
+      for (final command in commands) {
+        final knownPaths = _knownWindowsPaths(command);
+        for (final exePath in knownPaths) {
+          try {
+            final f = File(exePath);
+            if (await f.exists()) {
+              await Process.start(
+                exePath,
+                arguments,
+                mode: ProcessStartMode.detached,
+              );
+              return true;
+            }
+          } catch (_) {
+            continue;
+          }
         }
       }
 
@@ -421,9 +454,11 @@ class ExternalPlayerService {
       if (player.desktopCommand != null) {
         try {
           if (await _isCommandAvailable(player.desktopCommand!)) {
-            await Process.start(player.desktopCommand!, [
-              videoUrl,
-            ], mode: ProcessStartMode.detached);
+            await Process.start(
+              player.desktopCommand!,
+              buildDesktopLaunchArguments(player, videoUrl),
+              mode: ProcessStartMode.detached,
+            );
             return true;
           }
         } catch (_) {
@@ -434,6 +469,29 @@ class ExternalPlayerService {
       if (kDebugMode) debugPrint('Linux launch error: $e');
     }
     return false;
+  }
+
+  /// Builds the URL argument without invoking a shell, preserving query
+  /// parameters and preventing command-line metacharacters from being parsed.
+  @visibleForTesting
+  List<String> buildDesktopLaunchArguments(
+    ExternalPlayer player,
+    String videoUrl,
+  ) {
+    return ['${player.desktopUrlArgumentPrefix}$videoUrl'];
+  }
+
+  List<String> _knownWindowsPaths(String command) {
+    final paths = <String>[...?_windowsPlayerPaths[command]];
+
+    // Microsoft Store execution aliases live here even when `where` cannot
+    // resolve them (for example when WindowsApps was removed from PATH).
+    final localAppData = Platform.environment['LOCALAPPDATA'];
+    if (localAppData != null && localAppData.isNotEmpty) {
+      paths.add('$localAppData\\Microsoft\\WindowsApps\\$command');
+    }
+
+    return paths;
   }
 
   Future<bool> _isCommandAvailable(String command) async {
