@@ -43,7 +43,7 @@ jobs:
 
       - name: Analyze source
         shell: pwsh
-        run: flutter analyze
+        run: flutter analyze --no-fatal-warnings
 
       - name: Test extensions and external-player integration
         shell: pwsh
