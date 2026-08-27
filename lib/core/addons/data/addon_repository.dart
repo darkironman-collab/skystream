@@ -39,19 +39,6 @@ class AddonsState {
 class AddonRepository extends _$AddonRepository {
   static const String _prefsKey = 'stremio_addons_v2';
 
-  /// The lightweight Windows build does not execute CloudStream `.cs3` / JAR
-  /// bytecode locally. Instead it talks to the user's compatible CloudStream
-  /// bridge through the already-supported Stremio add-on protocol.
-  ///
-  /// Keeping this as a dart-define makes the build portable: a different
-  /// bridge can be injected without changing source, while this fork has a
-  /// useful default that works with its existing ExtremeOS deployment.
-  static const String _cloudStreamBridgeManifest = String.fromEnvironment(
-    'CLOUDSTREAM_BRIDGE_MANIFEST',
-    defaultValue:
-        'https://bridge.80.225.234.151.sslip.io/p/dark-ironman/manifest.json',
-  );
-
   @override
   AddonsState build() {
     Future.microtask(load);
@@ -76,63 +63,12 @@ class AddonRepository extends _$AddonRepository {
           if (kDebugMode) debugPrint('[AddonRepository] bad entry: $error');
         }
       }
-
-      final bridgeAdded = await _ensureCloudStreamBridge(addons);
       state = AddonsState(addons: addons, isLoading: false);
-      if (bridgeAdded) {
-        await _persist(addons);
-      }
-
       // Manifests can change (new catalogs, renamed rows); refresh quietly.
       unawaited(refreshAll(silent: true));
     } catch (error) {
       if (kDebugMode) debugPrint('[AddonRepository] load failed: $error');
       state = const AddonsState(addons: [], isLoading: false);
-    }
-  }
-
-  Future<bool> _ensureCloudStreamBridge(List<ManagedAddon> addons) async {
-    final configured = _cloudStreamBridgeManifest.trim();
-    if (configured.isEmpty) return false;
-
-    final url = AddonTransport.normalizeManifestUrl(configured);
-    if (!AddonTransport.looksValid(url)) {
-      if (kDebugMode) {
-        debugPrint('[AddonRepository] invalid CloudStream bridge URL: $url');
-      }
-      return false;
-    }
-
-    if (addons.any((addon) => addon.manifestUrl == url)) return false;
-
-    try {
-      final manifest = await ref
-          .read(addonClientProvider)
-          .fetchManifest(url, forceRefresh: true);
-      if (!manifest.hasResource('stream')) {
-        if (kDebugMode) {
-          debugPrint(
-            '[AddonRepository] CloudStream bridge has no stream resource',
-          );
-        }
-        return false;
-      }
-      addons.add(
-        ManagedAddon(
-          manifestUrl: url,
-          manifest: manifest,
-          addedAt: DateTime.now(),
-        ),
-      );
-      return true;
-    } catch (error) {
-      // A bridge outage must never stop the app from opening. Existing native
-      // SkyStream/Nuvio/Stremio sources remain usable and the next launch can
-      // try the bridge again.
-      if (kDebugMode) {
-        debugPrint('[AddonRepository] CloudStream bridge unavailable: $error');
-      }
-      return false;
     }
   }
 
