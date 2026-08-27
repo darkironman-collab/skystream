@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:archive/archive.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
 
 import '../models/extension_plugin.dart';
 
@@ -20,11 +22,20 @@ final cloudStreamBackendServiceProvider = Provider<CloudStreamBackendService>((r
 /// The backend is a child process bound to 127.0.0.1 only. A random per-process
 /// token is required on every request, so other local applications cannot
 /// silently drive the plugin runtime.
+///
+/// CloudStream repositories publish two plugin shapes in practice:
+///  * cross-platform JVM JARs via `jarUrl` (for example several Phisher builds)
+///  * Android `.cs3` ZIPs containing `classes.dex` (for example CNCVerse)
+///
+/// JVM JARs are handed directly to the local backend. DEX-only CS3 packages are
+/// converted locally with the bundled Apache-2.0 dex2jar tool and then loaded by
+/// exactly the same JVM backend. No remote bridge is involved.
 class CloudStreamBackendService {
   final Dio _dio;
   Process? _process;
   Future<bool>? _startFuture;
   int? _port;
+  Directory? _dataDir;
   late final String _token;
   StreamSubscription<String>? _stdoutSub;
   StreamSubscription<String>? _stderrSub;
@@ -33,9 +44,9 @@ class CloudStreamBackendService {
       : _dio = dio ??
             Dio(
               BaseOptions(
-                connectTimeout: const Duration(seconds: 4),
+                connectTimeout: const Duration(seconds: 6),
                 receiveTimeout: const Duration(seconds: 95),
-                sendTimeout: const Duration(seconds: 20),
+                sendTimeout: const Duration(seconds: 30),
                 validateStatus: (status) => status != null && status < 500,
               ),
             ) {
@@ -75,9 +86,10 @@ class CloudStreamBackendService {
     final appData = Platform.environment['APPDATA'];
     final dataDir = Directory(
       appData != null && appData.isNotEmpty
-          ? '$appData${Platform.pathSeparator}SkyStream${Platform.pathSeparator}cloudstream-backend'
-          : '${executableDir.path}${Platform.pathSeparator}cloudstream-data',
+          ? p.join(appData, 'SkyStream', 'cloudstream-backend')
+          : p.join(executableDir.path, 'cloudstream-data'),
     )..createSync(recursive: true);
+    _dataDir = dataDir;
 
     final ready = Completer<int>();
     final process = await Process.start(
@@ -146,14 +158,186 @@ class CloudStreamBackendService {
         'message': 'Local CloudStream runtime is unavailable.',
       };
     }
-    final payload = <String, dynamic>{
-      'name': plugin.name,
-      'internalName': plugin.manifest['internalName'],
-      'url': plugin.sourceUrl,
-      'jarUrl': plugin.manifest['jarUrl'],
-      'jarHash': plugin.manifest['jarHash'],
+
+    final jarUrl = plugin.manifest['jarUrl']?.toString().trim() ?? '';
+    if (jarUrl.isNotEmpty) {
+      final payload = <String, dynamic>{
+        'name': plugin.name,
+        'internalName': plugin.manifest['internalName'],
+        'url': plugin.sourceUrl,
+        'jarUrl': jarUrl,
+        'jarHash': plugin.manifest['jarHash'],
+      };
+      return _post('/plugins/install', payload);
+    }
+
+    if (plugin.sourceUrl.toLowerCase().endsWith('.cs3')) {
+      return _installDexCs3(plugin);
+    }
+
+    return {
+      'ok': false,
+      'status': 'no_runtime_artifact',
+      'message': 'This CloudStream provider has neither jarUrl nor a CS3 package.',
     };
-    return _post('/plugins/install', payload);
+  }
+
+  Future<Map<String, dynamic>> _installDexCs3(ExtensionPlugin plugin) async {
+    final executableDir = File(Platform.resolvedExecutable).parent;
+    final dex2jar = _findDex2Jar(executableDir);
+    if (dex2jar == null) {
+      return {
+        'ok': false,
+        'status': 'dex_converter_unavailable',
+        'message': 'Bundled dex2jar runtime is missing.',
+      };
+    }
+
+    final dataDir = _dataDir;
+    if (dataDir == null) {
+      return {
+        'ok': false,
+        'status': 'backend_unavailable',
+        'message': 'CloudStream data directory is unavailable.',
+      };
+    }
+
+    final safeName = _safeFileName(
+      plugin.manifest['internalName']?.toString().trim().isNotEmpty == true
+          ? plugin.manifest['internalName'].toString().trim()
+          : plugin.name,
+    );
+
+    final conversionDir = Directory(p.join(dataDir.path, 'conversion'))
+      ..createSync(recursive: true);
+    final dexFile = File(p.join(conversionDir.path, '$safeName.dex'));
+    final convertedJar = File(p.join(conversionDir.path, '$safeName-jvm.jar'));
+
+    try {
+      final response = await _dio.get<List<int>>(
+        plugin.sourceUrl,
+        options: Options(
+          responseType: ResponseType.bytes,
+          headers: const {
+            'User-Agent': 'SkyStream-CloudStream-Backend/0.2',
+          },
+        ),
+      );
+      final bytes = response.data;
+      if (bytes == null || bytes.length < 200) {
+        return {
+          'ok': false,
+          'status': 'cs3_download_failed',
+          'message': 'The CS3 package download was empty or invalid.',
+        };
+      }
+
+      final archive = ZipDecoder().decodeBytes(bytes, verify: true);
+      final dexEntry = archive.findFile('classes.dex');
+      if (dexEntry == null || !dexEntry.isFile) {
+        return {
+          'ok': false,
+          'status': 'cs3_missing_dex',
+          'message': 'The CS3 package does not contain classes.dex.',
+        };
+      }
+
+      final dexBytes = dexEntry.content;
+      if (dexBytes is List<int>) {
+        await dexFile.writeAsBytes(dexBytes, flush: true);
+      } else {
+        return {
+          'ok': false,
+          'status': 'cs3_invalid_dex',
+          'message': 'Unable to read classes.dex from the CS3 package.',
+        };
+      }
+
+      if (await convertedJar.exists()) await convertedJar.delete();
+
+      final java = _findJava(executableDir);
+      final classPath = p.join(dex2jar.path, 'lib', '*');
+      final process = await Process.run(
+        java,
+        [
+          '-cp',
+          classPath,
+          'com.googlecode.dex2jar.tools.Dex2jarCmd',
+          '-f',
+          '-o',
+          convertedJar.path,
+          dexFile.path,
+        ],
+        workingDirectory: conversionDir.path,
+        runInShell: false,
+        stdoutEncoding: utf8,
+        stderrEncoding: utf8,
+      ).timeout(const Duration(seconds: 75));
+
+      if (process.exitCode != 0 ||
+          !await convertedJar.exists() ||
+          await convertedJar.length() < 200) {
+        final detail = '${process.stderr}\n${process.stdout}'.trim();
+        return {
+          'ok': false,
+          'status': 'dex_conversion_failed',
+          'message': detail.isEmpty
+              ? 'DEX to JVM conversion failed.'
+              : 'DEX to JVM conversion failed: ${_short(detail)}',
+        };
+      }
+
+      final pluginsDir = Directory(p.join(dataDir.path, 'plugins'))
+        ..createSync(recursive: true);
+      final target = File(p.join(pluginsDir.path, '$safeName.jar'));
+      await convertedJar.copy(target.path);
+
+      final restarted = await restart();
+      if (!restarted) {
+        return {
+          'ok': false,
+          'status': 'backend_restart_failed',
+          'message': 'Converted the CS3 package but could not restart the local runtime.',
+        };
+      }
+
+      final active = await providers();
+      final targetName = p.basename(target.path).toLowerCase();
+      final loaded = active.where((entry) {
+        final source = entry['sourcePlugin']?.toString().toLowerCase() ?? '';
+        return source.endsWith(targetName);
+      }).toList(growable: false);
+
+      if (loaded.isEmpty) {
+        return {
+          'ok': false,
+          'status': 'dex_no_provider',
+          'message':
+              'The CS3 package converted to JVM bytecode, but its provider could not be loaded locally. It may depend on Android-only APIs.',
+          'providers': active,
+        };
+      }
+
+      return {
+        'ok': true,
+        'status': 'installed_dex',
+        'message': 'Converted and loaded ${loaded.length} CloudStream provider(s) locally.',
+        'providers': loaded,
+      };
+    } on TimeoutException {
+      return {
+        'ok': false,
+        'status': 'dex_conversion_timeout',
+        'message': 'DEX conversion timed out.',
+      };
+    } catch (error) {
+      if (kDebugMode) debugPrint('[CloudStreamBackend] DEX install failed: $error');
+      return {
+        'ok': false,
+        'status': 'dex_error',
+        'message': error.toString(),
+      };
+    }
   }
 
   Future<List<Map<String, dynamic>>> providers() async {
@@ -251,14 +435,21 @@ class CloudStreamBackendService {
   File? _findBackendJar(Directory executableDir) {
     final candidates = [
       File(
-        '${executableDir.path}${Platform.pathSeparator}cloudstream-backend${Platform.pathSeparator}skystream-cloudstream-backend-all.jar',
+        p.join(
+          executableDir.path,
+          'cloudstream-backend',
+          'skystream-cloudstream-backend-all.jar',
+        ),
       ),
+      File(p.join(executableDir.path, 'cloudstream-backend', 'backend.jar')),
       File(
-        '${executableDir.path}${Platform.pathSeparator}cloudstream-backend${Platform.pathSeparator}backend.jar',
-      ),
-      // Developer convenience when running from the repository root.
-      File(
-        '${Directory.current.path}${Platform.pathSeparator}cloudstream_backend${Platform.pathSeparator}build${Platform.pathSeparator}libs${Platform.pathSeparator}skystream-cloudstream-backend-0.1.0-all.jar',
+        p.join(
+          Directory.current.path,
+          'cloudstream_backend',
+          'build',
+          'libs',
+          'skystream-cloudstream-backend-0.1.0-all.jar',
+        ),
       ),
     ];
     for (final candidate in candidates) {
@@ -267,19 +458,52 @@ class CloudStreamBackendService {
     return null;
   }
 
+  Directory? _findDex2Jar(Directory executableDir) {
+    final direct = Directory(
+      p.join(executableDir.path, 'cloudstream-backend', 'dex2jar'),
+    );
+    if (Directory(p.join(direct.path, 'lib')).existsSync()) return direct;
+
+    if (direct.existsSync()) {
+      for (final entity in direct.listSync(followLinks: false)) {
+        if (entity is Directory &&
+            Directory(p.join(entity.path, 'lib')).existsSync()) {
+          return entity;
+        }
+      }
+    }
+    return null;
+  }
+
   String _findJava(Directory executableDir) {
     final candidates = [
       File(
-        '${executableDir.path}${Platform.pathSeparator}cloudstream-backend${Platform.pathSeparator}runtime${Platform.pathSeparator}bin${Platform.pathSeparator}java.exe',
+        p.join(
+          executableDir.path,
+          'cloudstream-backend',
+          'runtime',
+          'bin',
+          'java.exe',
+        ),
       ),
-      File(
-        '${executableDir.path}${Platform.pathSeparator}runtime${Platform.pathSeparator}bin${Platform.pathSeparator}java.exe',
-      ),
+      File(p.join(executableDir.path, 'runtime', 'bin', 'java.exe')),
     ];
     for (final candidate in candidates) {
       if (candidate.existsSync()) return candidate.path;
     }
     return 'java';
+  }
+
+  String _safeFileName(String value) {
+    final cleaned = value
+        .replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_')
+        .replaceAll(RegExp(r'^[._-]+|[._-]+$'), '');
+    return cleaned.isEmpty ? 'plugin' : cleaned;
+  }
+
+  String _short(String value) {
+    final normalized = value.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return normalized.length <= 500 ? normalized : '${normalized.substring(0, 500)}…';
   }
 
   Future<void> dispose() async {
