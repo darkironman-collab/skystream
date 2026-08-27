@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           ref: cloudstream-clean-links-20260827
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Apply guarded patch
         run: python3 tools/apply_clean_links_patch.py
